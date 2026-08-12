@@ -1,5 +1,6 @@
 -- UC-for-Logi: MX Master remap on the RECEIVING Mac (via Universal Control)
--- btn=5 (thumb gesture button):
+--
+-- Gesture button (the thumb rest):
 --   click            → Mission Control
 --   drag left        → Desktop Right
 --   drag right       → Desktop Left
@@ -8,7 +9,24 @@
 -- Scroll wheel:
 --   vertical         → INVERTED for mouse (MX Master), passthrough for trackpad
 --   horizontal tilt  → passthrough
--- All other buttons (0,1,2,3,4) passthrough.
+-- Every other button passes through untouched.
+--
+-- WHICH BUTTON IS THE GESTURE BUTTON DEPENDS ON THE GENERATION:
+--
+--   MX Master 3S and older : CGEvent button 5. The thumb rest IS the gesture
+--                            button, and there is no button 6.
+--   MX Master 4            : CGEvent button 6. The thumb rest became the
+--                            haptic "Actions Ring" pad, and button 5 is now a
+--                            NEW third side button sitting next to back and
+--                            forward. Binding 5 on an MX Master 4 therefore
+--                            does two wrong things at once: it misses the
+--                            gesture pad, and it swallows a usable button.
+--
+-- So the number is resolved from whichever mouse this Mac can actually see,
+-- and falls back to a constant when it can see none. That fallback is the
+-- normal path for this project's original use case: over Universal Control the
+-- receiving Mac gets synthesized CGEvents with no HID device behind them, so
+-- there is nothing to detect.
 --
 -- Note: CGEventTap cannot distinguish UC-forwarded events from local ones,
 -- so this remap applies to ANY mouse on this Mac (including local Bluetooth).
@@ -18,8 +36,45 @@ local et    = hs.eventtap.event
 local props = et.properties
 local types = et.types
 
-local DRAG_THRESHOLD = 40   -- px; below this counts as click
-local DEBUG = true
+-- ---------- config ----------
+local DRAG_THRESHOLD = 40     -- px; below this counts as click
+local DEBUG          = true   -- log gestures to the Hammerspoon console
+local PROBE_MODE     = false  -- true = remap NOTHING, just report button numbers
+
+-- Gesture button per model, most specific name first (the match is a plain
+-- substring, and "MX Master 3" would otherwise also match "MX Master 3S").
+-- Own something not listed? Set PROBE_MODE = true, press the button, read the
+-- number off the screen, then add a row here.
+local MODEL_GESTURE_BUTTON = {
+    { "MX Master 4",  6 },
+    { "MX Master 3S", 5 },
+    { "MX Master 3",  5 },
+    { "MX Master 2S", 5 },
+}
+
+-- Used when no known MX Master is visible to this Mac, which is exactly the
+-- Universal Control case. Set this to the generation you drive this Mac with.
+local FALLBACK_GESTURE_BUTTON = 6
+
+-- ---------- model detection ----------
+local GESTURE_BUTTON, GESTURE_SOURCE
+
+local function resolveGestureButton()
+    local out = hs.execute(
+        "/usr/sbin/ioreg -c IOHIDDevice -r -d 1 2>/dev/null | grep '\"Product\"'"
+    ) or ""
+    for _, row in ipairs(MODEL_GESTURE_BUTTON) do
+        local model, btn = row[1], row[2]
+        if out:find(model, 1, true) then
+            GESTURE_BUTTON, GESTURE_SOURCE = btn, model
+            return
+        end
+    end
+    GESTURE_BUTTON = FALLBACK_GESTURE_BUTTON
+    GESTURE_SOURCE = "no local MX Master, assuming Universal Control"
+end
+
+resolveGestureButton()
 
 -- ---------- actions ----------
 local function missionControl() hs.spaces.toggleMissionControl() end
@@ -56,16 +111,24 @@ end
 
 -- ---------- state ----------
 -- Accumulate event-level deltas instead of reading cursor position,
--- because we swallow the drag events (cursor is frozen while btn=5 held).
+-- because we swallow the drag events (cursor is frozen while the button held).
 local gesture = { active = false, dx = 0, dy = 0 }
 
 -- ---------- event tap ----------
-mxTap = hs.eventtap.new({
+local tapTypes = {
     types.otherMouseDown,
     types.otherMouseDragged,
     types.otherMouseUp,
     types.scrollWheel,
-}, function(e)
+}
+-- Left and right are only interesting while probing, so they cost nothing
+-- on the normal path.
+if PROBE_MODE then
+    table.insert(tapTypes, types.leftMouseDown)
+    table.insert(tapTypes, types.rightMouseDown)
+end
+
+mxTap = hs.eventtap.new(tapTypes, function(e)
     local t = e:getType()
 
     -- ===== scroll: invert vertical for mouse only =====
@@ -76,14 +139,26 @@ mxTap = hs.eventtap.new({
             local pd1 = e:getProperty(props.scrollWheelEventPointDeltaAxis1) or 0
             e:setProperty(props.scrollWheelEventDeltaAxis1,      -d1)
             e:setProperty(props.scrollWheelEventPointDeltaAxis1, -pd1)
-            if DEBUG then print(string.format("[scroll] mouse invert dy: %d → %d", d1, -d1)) end
         end
         return false  -- pass through (modified or not)
     end
 
-    -- ===== gesture button (btn=5) =====
     local btn = e:getProperty(props.mouseEventButtonNumber)
-    if btn ~= 5 then return false end
+
+    -- ===== probe: report, never remap =====
+    if PROBE_MODE then
+        if t ~= types.otherMouseDragged then
+            print(string.format("[probe] %s btn=%s", tostring(t), tostring(btn)))
+            if t ~= types.otherMouseUp then
+                hs.alert.closeAll()
+                hs.alert.show("BUTTON  " .. tostring(btn), 1.2)
+            end
+        end
+        return false
+    end
+
+    -- ===== gesture button =====
+    if btn ~= GESTURE_BUTTON then return false end
 
     if t == types.otherMouseDown then
         gesture.active, gesture.dx, gesture.dy = true, 0, 0
@@ -116,7 +191,46 @@ mxTap = hs.eventtap.new({
 end)
 
 mxTap:start()
-hs.alert.show("MX Master remap ON\n(gesture + scroll invert)")
-print("==== UC-for-Logi remap started ====")
-print("btn=5: click=MC | L=DeskR R=DeskL U=Launchpad D=ShowDesktop")
-print("scroll: invert dy for mouse, trackpad unchanged")
+
+-- ---------- re-detect when the hardware may have changed ----------
+-- Swapping mice mid-session, or waking with a different one paired, would
+-- otherwise leave the wrong button bound until the next manual reload.
+mxWake = hs.caffeinate.watcher.new(function(ev)
+    local w = hs.caffeinate.watcher
+    if ev == w.systemDidWake or ev == w.screensDidUnlock then
+        local before = GESTURE_BUTTON
+        resolveGestureButton()
+        if DEBUG and GESTURE_BUTTON ~= before then
+            print(string.format("[mx] re-detected %s, gesture button now %d",
+                GESTURE_SOURCE, GESTURE_BUTTON))
+        end
+    end
+end):start()
+
+-- ---------- conveniences ----------
+-- `hs` CLI control of a running instance (e.g. echo 'hs.reload()' | hs).
+pcall(function() require("hs.ipc") end)
+
+-- Auto-reload on any .lua change in ~/.hammerspoon so edits take effect
+-- without touching the menu bar. Keep logs OUT of this directory or the
+-- logger will retrigger the watcher in a loop.
+local function reloadOnLua(files)
+    for _, f in ipairs(files) do
+        if f:sub(-4) == ".lua" then hs.reload(); return end
+    end
+end
+cfgWatcher = hs.pathwatcher.new(os.getenv("HOME") .. "/.hammerspoon/", reloadOnLua):start()
+
+-- ---------- startup banner ----------
+if PROBE_MODE then
+    hs.alert.show("MX Master PROBE MODE\nremap disabled")
+    print("==== UC-for-Logi PROBE MODE (no remapping) ====")
+else
+    hs.alert.show(string.format(
+        "MX Master remap ON\n%s, button %d", GESTURE_SOURCE, GESTURE_BUTTON))
+    print("==== UC-for-Logi remap started ====")
+    print(string.format("detected: %s → gesture button %d",
+        GESTURE_SOURCE, GESTURE_BUTTON))
+    print("click=MC | L=DeskR R=DeskL U=Launchpad D=ShowDesktop")
+    print("scroll: invert dy for mouse, trackpad unchanged")
+end
