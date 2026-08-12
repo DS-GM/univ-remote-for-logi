@@ -1,6 +1,28 @@
--- UC-for-Logi: MX Master remap on the RECEIVING Mac (via Universal Control)
+-- =====================================================================
+--  univ-remote-for-logi  ::  FOR THE LOGITECH MX MASTER 4
+-- =====================================================================
+--  THIS FILE IS FOR THE MX MASTER 4 ONLY.
+--  On an MX Master 3S / 3 / 2S the gesture button is a DIFFERENT number
+--  and nothing will happen. Use ../mx-master-3s/init.lua instead.
 --
--- Gesture button (the thumb rest):
+--  Why the two are not interchangeable:
+--    The MX Master 4 added a third side button next to back and forward,
+--    and that new button took CGEvent number 5. That pushed the thumb
+--    rest, now the haptic "Actions Ring" pad, up to number 6.
+--
+--      button        MX Master 3S      MX Master 4
+--      ------        ------------      -----------
+--      back                 3                    3
+--      forward              4                    4
+--      third side    not present                 5   <- new
+--      thumb rest           5                    6
+--
+--    So a config hardcoded to 5 fails twice over on an MX Master 4: it
+--    never sees the gesture pad, and it silently swallows the new side
+--    button. Hence GESTURE_BUTTON = 6 below.
+-- =====================================================================
+--
+-- Gesture button (the thumb rest / Actions Ring pad):
 --   click            → Mission Control
 --   drag left        → Desktop Right
 --   drag right       → Desktop Left
@@ -11,23 +33,6 @@
 --   horizontal tilt  → passthrough
 -- Every other button passes through untouched.
 --
--- WHICH BUTTON IS THE GESTURE BUTTON DEPENDS ON THE GENERATION:
---
---   MX Master 3S and older : CGEvent button 5. The thumb rest IS the gesture
---                            button, and there is no button 6.
---   MX Master 4            : CGEvent button 6. The thumb rest became the
---                            haptic "Actions Ring" pad, and button 5 is now a
---                            NEW third side button sitting next to back and
---                            forward. Binding 5 on an MX Master 4 therefore
---                            does two wrong things at once: it misses the
---                            gesture pad, and it swallows a usable button.
---
--- So the number is resolved from whichever mouse this Mac can actually see,
--- and falls back to a constant when it can see none. That fallback is the
--- normal path for this project's original use case: over Universal Control the
--- receiving Mac gets synthesized CGEvents with no HID device behind them, so
--- there is nothing to detect.
---
 -- Note: CGEventTap cannot distinguish UC-forwarded events from local ones,
 -- so this remap applies to ANY mouse on this Mac (including local Bluetooth).
 -- Trackpad is exempt via the `isContinuous` scroll property.
@@ -37,44 +42,11 @@ local props = et.properties
 local types = et.types
 
 -- ---------- config ----------
+local GESTURE_BUTTON = 6      -- MX Master 4 thumb rest. Do not change to 5;
+                              -- 5 is the new third side button on this mouse.
 local DRAG_THRESHOLD = 40     -- px; below this counts as click
 local DEBUG          = true   -- log gestures to the Hammerspoon console
 local PROBE_MODE     = false  -- true = remap NOTHING, just report button numbers
-
--- Gesture button per model, most specific name first (the match is a plain
--- substring, and "MX Master 3" would otherwise also match "MX Master 3S").
--- Own something not listed? Set PROBE_MODE = true, press the button, read the
--- number off the screen, then add a row here.
-local MODEL_GESTURE_BUTTON = {
-    { "MX Master 4",  6 },
-    { "MX Master 3S", 5 },
-    { "MX Master 3",  5 },
-    { "MX Master 2S", 5 },
-}
-
--- Used when no known MX Master is visible to this Mac, which is exactly the
--- Universal Control case. Set this to the generation you drive this Mac with.
-local FALLBACK_GESTURE_BUTTON = 6
-
--- ---------- model detection ----------
-local GESTURE_BUTTON, GESTURE_SOURCE
-
-local function resolveGestureButton()
-    local out = hs.execute(
-        "/usr/sbin/ioreg -c IOHIDDevice -r -d 1 2>/dev/null | grep '\"Product\"'"
-    ) or ""
-    for _, row in ipairs(MODEL_GESTURE_BUTTON) do
-        local model, btn = row[1], row[2]
-        if out:find(model, 1, true) then
-            GESTURE_BUTTON, GESTURE_SOURCE = btn, model
-            return
-        end
-    end
-    GESTURE_BUTTON = FALLBACK_GESTURE_BUTTON
-    GESTURE_SOURCE = "no local MX Master, assuming Universal Control"
-end
-
-resolveGestureButton()
 
 -- ---------- actions ----------
 local function missionControl() hs.spaces.toggleMissionControl() end
@@ -148,7 +120,7 @@ mxTap = hs.eventtap.new(tapTypes, function(e)
     -- ===== probe: report, never remap =====
     if PROBE_MODE then
         if t ~= types.otherMouseDragged then
-            print(string.format("[probe] %s btn=%s", tostring(t), tostring(btn)))
+            print(string.format("[probe] type=%s btn=%s", tostring(t), tostring(btn)))
             if t ~= types.otherMouseUp then
                 hs.alert.closeAll()
                 hs.alert.show("BUTTON  " .. tostring(btn), 1.2)
@@ -192,45 +164,39 @@ end)
 
 mxTap:start()
 
--- ---------- re-detect when the hardware may have changed ----------
--- Swapping mice mid-session, or waking with a different one paired, would
--- otherwise leave the wrong button bound until the next manual reload.
-mxWake = hs.caffeinate.watcher.new(function(ev)
-    local w = hs.caffeinate.watcher
-    if ev == w.systemDidWake or ev == w.screensDidUnlock then
-        local before = GESTURE_BUTTON
-        resolveGestureButton()
-        if DEBUG and GESTURE_BUTTON ~= before then
-            print(string.format("[mx] re-detected %s, gesture button now %d",
-                GESTURE_SOURCE, GESTURE_BUTTON))
-        end
-    end
-end):start()
-
 -- ---------- conveniences ----------
--- `hs` CLI control of a running instance (e.g. echo 'hs.reload()' | hs).
+-- `hs` CLI control of a running instance, e.g. echo 'hs.reload()' | hs
 pcall(function() require("hs.ipc") end)
 
--- Auto-reload on any .lua change in ~/.hammerspoon so edits take effect
--- without touching the menu bar. Keep logs OUT of this directory or the
--- logger will retrigger the watcher in a loop.
+-- Auto-reload on any .lua change. When ~/.hammerspoon/init.lua is a symlink
+-- into a checkout (the switch.sh workflow), the edits land in the checkout,
+-- not here, so watch that directory too or they would never fire.
 local function reloadOnLua(files)
     for _, f in ipairs(files) do
         if f:sub(-4) == ".lua" then hs.reload(); return end
     end
 end
-cfgWatcher = hs.pathwatcher.new(os.getenv("HOME") .. "/.hammerspoon/", reloadOnLua):start()
+local home     = os.getenv("HOME")
+local selfPath = home .. "/.hammerspoon/init.lua"
+local watchDirs = { home .. "/.hammerspoon/" }
+local resolved = hs.fs.pathToAbsolute(selfPath)
+if resolved then
+    local dir = resolved:match("^(.*/)[^/]*$")
+    if dir and dir ~= watchDirs[1] then watchDirs[#watchDirs + 1] = dir end
+end
+cfgWatchers = {}
+for _, d in ipairs(watchDirs) do
+    cfgWatchers[#cfgWatchers + 1] = hs.pathwatcher.new(d, reloadOnLua):start()
+end
 
 -- ---------- startup banner ----------
 if PROBE_MODE then
-    hs.alert.show("MX Master PROBE MODE\nremap disabled")
-    print("==== UC-for-Logi PROBE MODE (no remapping) ====")
+    hs.alert.show("MX Master 4 PROBE MODE\nremap disabled")
+    print("==== UC-for-Logi [MX Master 4] PROBE MODE (no remapping) ====")
 else
-    hs.alert.show(string.format(
-        "MX Master remap ON\n%s, button %d", GESTURE_SOURCE, GESTURE_BUTTON))
-    print("==== UC-for-Logi remap started ====")
-    print(string.format("detected: %s → gesture button %d",
-        GESTURE_SOURCE, GESTURE_BUTTON))
+    hs.alert.show("MX Master 4 remap ON\ngesture button " .. GESTURE_BUTTON)
+    print("==== UC-for-Logi [MX Master 4] remap started ====")
+    print("gesture button " .. GESTURE_BUTTON .. " (thumb rest / Actions Ring)")
     print("click=MC | L=DeskR R=DeskL U=Launchpad D=ShowDesktop")
     print("scroll: invert dy for mouse, trackpad unchanged")
 end

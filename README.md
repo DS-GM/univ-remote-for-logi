@@ -3,9 +3,27 @@
 Bring your Logitech MX Master gestures back when the mouse is being forwarded
 to another Mac via **Universal Control**.
 
-Supports **MX Master 4** and **MX Master 3S / 3 / 2S**. The gesture button moved
-between those generations, so the script resolves it per model rather than
-hardcoding one number. See [Button numbers](#button-numbers).
+## Pick your mouse first
+
+The gesture button changed number between generations, so there is one config
+per generation. They are not interchangeable.
+
+| Your mouse                     | Use this config                          | Gesture button |
+| ------------------------------ | ---------------------------------------- | -------------- |
+| **MX Master 4**                | [`mx-master-4/`](mx-master-4/)           | **6**          |
+| **MX Master 3S / 3 / 2S**      | [`mx-master-3s/`](mx-master-3s/)         | **5**          |
+
+```bash
+git clone https://github.com/DS-GM/univ-remote-for-logi.git
+cd univ-remote-for-logi
+
+./switch.sh 4      # MX Master 4
+./switch.sh 3s     # MX Master 3S / 3 / 2S
+./switch.sh        # report which one is active
+```
+
+Switching is symmetric, so going back to the 3S later is just
+`./switch.sh 3s`. Nothing is lost either way.
 
 ## The Problem
 
@@ -26,8 +44,7 @@ sits at that layer via Hammerspoon and re-implements the most-missed gestures.
 
 ## What It Does
 
-Thumb-rest gesture button (button 6 on MX Master 4, button 5 on MX Master 3S
-and older):
+Thumb-rest gesture button:
 
 | Input            | Action                |
 | ---------------- | --------------------- |
@@ -45,8 +62,8 @@ Scroll wheel:
   `scrollWheelEventIsContinuous` property (0 = wheel, 1 = trackpad).
 - Horizontal tilt passes through unchanged.
 
-All other buttons (left, right, middle, back, forward, and the MX Master 4's
-extra side button) pass through unchanged.
+Every other button passes through unchanged, including the MX Master 4's extra
+side button.
 
 ## Button numbers
 
@@ -68,30 +85,13 @@ pad, up to number 6.
 
 So a config hardcoded to button 5 does two wrong things at once on an MX Master
 4: it never sees the gesture pad, and it silently swallows the new side button.
-That is the bug this version fixes.
+That is why the two configs are kept separate rather than merged behind a
+runtime check. The folder you install *is* the declaration of which mouse you
+are on.
 
 Verified on macOS with an MX Master 4 over Bluetooth LE (`0x046D` / `0xB042`),
 which reports all seven buttons plus working horizontal tilt with no Logitech
 software installed.
-
-### How the number is resolved
-
-1. The script runs `ioreg` at load and looks for a known model name among the
-   HID devices this Mac can currently see.
-2. On a match it uses that model's gesture button from `MODEL_GESTURE_BUTTON`.
-3. On no match it uses `FALLBACK_GESTURE_BUTTON`.
-
-Step 3 is the normal path for this project's original use case. Over Universal
-Control there is no HID device to find, so detection cannot work and the
-fallback constant is what actually applies. Set it to the generation you drive
-that Mac with:
-
-```lua
-local FALLBACK_GESTURE_BUTTON = 6   -- 6 for MX Master 4, 5 for 3S and older
-```
-
-Detection re-runs on system wake and unlock, so swapping between two paired
-mice is picked up without a manual reload.
 
 ## Requirements
 
@@ -113,20 +113,42 @@ brew install --cask hammerspoon
 
 Option B, direct download: <https://www.hammerspoon.org>
 
-### 2. Drop in the config
-
-```bash
-mkdir -p ~/.hammerspoon
-curl -fsSL https://raw.githubusercontent.com/DS-GM/univ-remote-for-logi/main/init.lua \
-  -o ~/.hammerspoon/init.lua
-```
-
-Or clone and symlink:
+### 2. Install the config for your mouse
 
 ```bash
 git clone https://github.com/DS-GM/univ-remote-for-logi.git
-ln -sf "$PWD/univ-remote-for-logi/init.lua" ~/.hammerspoon/init.lua
+cd univ-remote-for-logi
+./switch.sh 4        # or: ./switch.sh 3s
 ```
+
+`switch.sh` copies the variant you chose to `~/.hammerspoon/init.lua`, backs up
+any unrelated file that was already there, and reloads Hammerspoon.
+
+It **copies rather than symlinks by default**, which is deliberate. macOS gates
+`~/Documents`, `~/Desktop` and `~/Downloads` behind TCC. If your checkout sits
+in one of those and Hammerspoon has not been granted Files and Folders access
+to it, Hammerspoon cannot read through a symlink into the checkout, and
+`init.lua` then fails to load **entirely**: no tap, no `hs.ipc`, no error, no
+alert. Copying puts the file inside `~/.hammerspoon`, where that cannot happen.
+
+If your checkout is somewhere Hammerspoon can read, `--link` gives you the
+edit-in-place workflow instead:
+
+```bash
+./switch.sh 4 --link
+```
+
+Confirm the startup alert appears afterwards. Silence means it did not load.
+
+If you would rather not use the script, copy one file by hand:
+
+```bash
+mkdir -p ~/.hammerspoon
+curl -fsSL https://raw.githubusercontent.com/DS-GM/univ-remote-for-logi/main/mx-master-4/init.lua \
+  -o ~/.hammerspoon/init.lua
+```
+
+Swap `mx-master-4` for `mx-master-3s` on an older mouse.
 
 ### 3. Launch Hammerspoon and grant permissions
 
@@ -153,28 +175,35 @@ System Settings › Keyboard › Keyboard Shortcuts… › Mission Control:
 
 These must remain at their defaults. The script triggers them via AppleScript.
 
-### 5. Reload config
+### 5. Confirm it loaded
 
-Edits to any `.lua` file in `~/.hammerspoon` reload automatically. You can also
-use the menu bar (🔨 › **Reload Config**) or the CLI, since `hs.ipc` is loaded:
+You should see a transient alert naming the variant and button:
+
+> MX Master 4 remap ON
+> gesture button 6
+
+Then try the gesture button. Open the Hammerspoon Console (🔨 › Console) to
+watch the `[gesture]` log lines.
+
+Both configs load `hs.ipc`, so you can also drive a running instance:
 
 ```bash
 echo 'hs.reload()' | hs
 ```
 
-You should see a transient alert naming the detected mouse and button:
+Both configs auto-reload on any `.lua` save in `~/.hammerspoon`, so editing the
+installed file takes effect immediately. When installed with `--link`, they also
+watch the directory the symlink points into, so edits in the checkout reload too.
 
-> MX Master remap ON
-> MX Master 4, button 6
-
-Then try the gesture button. Open the Hammerspoon Console (🔨 › Console) to
-watch the `[gesture]` log lines.
+After a plain (copied) install, edits made in the checkout do not affect the
+running config until you re-run `./switch.sh`.
 
 ## Customization
 
-The top of `init.lua` has the tunables:
+The top of each `init.lua` has the tunables:
 
 ```lua
+local GESTURE_BUTTON = 6      -- set by the variant; see the table above
 local DRAG_THRESHOLD = 40     -- px; below this a gesture counts as a click
 local DEBUG          = true   -- set false to silence the console
 local PROBE_MODE     = false  -- true = remap nothing, just report button numbers
@@ -184,24 +213,14 @@ To change what each direction does, edit the five action functions:
 `missionControl`, `launchpad`, `showDesktop`, `desktopLeft`, `desktopRight`.
 They are small wrappers around `hs.spaces.*` and an AppleScript keystroke.
 
-### Finding the button number on an unlisted mouse
+### Finding the button number on a different mouse
 
-Set `PROBE_MODE = true` and save. The script stops remapping and instead flashes
+Set `PROBE_MODE = true` and save. The config stops remapping and instead flashes
 the CGEvent button number on screen each time you press one, and logs it to the
-Hammerspoon Console. Press the button you want, note the number, then add a row:
+Hammerspoon Console. Press the button you want, note the number, set
+`GESTURE_BUTTON` to it, then set `PROBE_MODE = false`.
 
-```lua
-local MODEL_GESTURE_BUTTON = {
-    { "MX Master 4",  6 },
-    { "MX Master 3S", 5 },
-    -- { "Your Mouse",  N },
-}
-```
-
-Order matters: the match is a plain substring, so more specific names go first.
-`"MX Master 3"` would otherwise also match `"MX Master 3S"`.
-
-Set `PROBE_MODE = false` when done.
+This is also the fastest way to tell whether a button reaches macOS at all.
 
 ## Known Limitations
 
@@ -209,11 +228,9 @@ Set `PROBE_MODE = false` when done.
   arrive with the same `srcPID=0` as local HID events, so the remap applies to
   any mouse on the receiving Mac. The trackpad exemption on scroll inversion
   works because trackpad events are flagged as continuous; there is no such
-  flag for buttons.
-- **Model detection only works for a locally connected mouse.** That is a
-  property of the problem, not a bug: over Universal Control there is no HID
-  device on the receiving Mac to detect. `FALLBACK_GESTURE_BUTTON` is the knob
-  that covers this case.
+  flag for buttons. This is also why the mouse generation is chosen by which
+  config you install rather than detected at runtime: over Universal Control
+  there is no HID device on the receiving Mac to detect.
 - **Space switching uses an AppleScript subprocess.** `hs.eventtap.keyStroke`
   and `newKeyEvent:setFlags` both drop the `Ctrl` modifier when invoked from
   inside a `CGEventTap` callback
@@ -224,10 +241,20 @@ Set `PROBE_MODE = false` when done.
   button is held, drag events are swallowed so the cursor stops moving. This
   mimics Logi Options+ gesture mode, but it is incidental, not a designed
   feature.
-- **The MX Master 4's Actions Ring is not reproduced.** This script treats the
-  thumb-rest pad as a plain button. The radial menu, per-slot haptics, and
-  app-aware slots that Logi Options+ draws on it all ride on Logitech's HID++
-  vendor protocol, which is not reachable from a `CGEventTap`.
+- **The MX Master 4's Actions Ring is not reproduced.** The MX Master 4 config
+  treats the thumb-rest pad as a plain button. The radial menu, per-slot
+  haptics, and app-aware slots that Logi Options+ draws on it all ride on
+  Logitech's HID++ vendor protocol, which is not reachable from a `CGEventTap`.
+- **A symlinked config inside a TCC-protected folder fails silently.** If
+  `~/.hammerspoon/init.lua` is a symlink into `~/Documents`, `~/Desktop` or
+  `~/Downloads` and Hammerspoon lacks Files and Folders access there, the
+  config does not load at all. There is no error, no alert, and no console
+  output, because the console output is itself produced by the file that never
+  ran. The symptom is simply a mouse with no gestures and an `hs` CLI that
+  reports the message port missing. This is why `switch.sh` copies by default.
+- **The two configs are deliberately duplicated.** Each `init.lua` is
+  self-contained so it can be curl'd as a single file. The cost is that a fix
+  to shared logic has to be applied to both.
 
 ## License
 
