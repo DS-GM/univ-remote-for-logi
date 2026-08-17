@@ -110,8 +110,16 @@ mxTap = hs.eventtap.new(tapTypes, function(e)
         if isContinuous == 0 then  -- 0 = discrete = physical wheel = mouse
             local d1  = e:getProperty(props.scrollWheelEventDeltaAxis1)      or 0
             local pd1 = e:getProperty(props.scrollWheelEventPointDeltaAxis1) or 0
-            e:setProperty(props.scrollWheelEventDeltaAxis1,      -d1)
-            e:setProperty(props.scrollWheelEventPointDeltaAxis1, -pd1)
+            -- Only write axis 1 when axis 1 actually carries something.
+            -- A horizontal tilt arrives as d1=0/pd1=0 with all of the movement
+            -- on axis 2. Writing to axis 1 unconditionally looks harmless,
+            -- because the value written is zero and reading the event back shows
+            -- every field unchanged, but the write itself makes the receiving
+            -- app drop the axis 2 component: side scrolling dies silently.
+            if d1 ~= 0 or pd1 ~= 0 then
+                e:setProperty(props.scrollWheelEventDeltaAxis1,      -d1)
+                e:setProperty(props.scrollWheelEventPointDeltaAxis1, -pd1)
+            end
         end
         return false  -- pass through (modified or not)
     end
