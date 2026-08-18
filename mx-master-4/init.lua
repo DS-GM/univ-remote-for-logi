@@ -176,6 +176,14 @@ mxTap:start()
 -- `hs` CLI control of a running instance, e.g. echo 'hs.reload()' | hs
 pcall(function() require("hs.ipc") end)
 
+-- Per-machine extras (personal hotkeys etc.) go in ~/.hammerspoon/extras.lua,
+-- which switch.sh never touches, so they survive variant switches. Optional:
+-- a missing file is fine, but a broken one should not fail silently.
+local extrasOk, extrasErr = pcall(require, "extras")
+if not extrasOk and not tostring(extrasErr):match("not found") then
+    print("extras.lua failed to load: " .. tostring(extrasErr))
+end
+
 -- Auto-reload on any .lua change. When ~/.hammerspoon/init.lua is a symlink
 -- into a checkout (the switch.sh workflow), the edits land in the checkout,
 -- not here, so watch that directory too or they would never fire.
