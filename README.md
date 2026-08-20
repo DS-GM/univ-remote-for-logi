@@ -222,8 +222,86 @@ Hammerspoon Console. Press the button you want, note the number, set
 
 This is also the fastest way to tell whether a button reaches macOS at all.
 
+## Per-machine extras (optional)
+
+Both configs try to load `~/.hammerspoon/extras.lua` once the mouse remap is
+running:
+
+```lua
+local extrasOk, extrasErr = pcall(require, "extras")
+```
+
+A missing file is fine and silent. A file that fails to parse prints the error
+to the Hammerspoon Console rather than dying quietly. `switch.sh` never touches
+it, so personal or machine-specific bindings survive switching between the
+`mx-master-4` and `mx-master-3s` variants.
+
+[extras.lua.example](extras.lua.example) is a working file with two recipes for
+the same two-Mac Universal Control desk this project targets. Copy it to
+`~/.hammerspoon/extras.lua` and edit the `PEER` line. Both recipes need SSH from
+the Mac holding the keyboard to the peer, so Remote Login on the peer and
+key-only auth. The second also needs Hammerspoon running there.
+
+### One key, displays off on both Macs
+
+Binds a lock key to `pmset displaysleepnow` on both machines instead of locking
+the screen. Displays only, so both Macs stay awake and Universal Control,
+Tailscale and SSH keep running.
+
+Probe your keyboard before binding, because what a lock key emits is often not
+what the legend suggests. An MX Keys sends plain ⌃⌘Q, which is macOS's own
+lock-screen shortcut. An 8BitDo Retro 108 sends Win+L, the Windows shortcut,
+which is Left GUI + L on the wire, and that arrives as ⌥L rather than ⌘L on a
+Mac which has Option and Command swapped for the keyboard under **System
+Settings > Keyboard > Keyboard Shortcuts > Modifier Keys**.
+
+### Caps Lock language switching across Universal Control
+
+**Universal Control does not forward Caps Lock.** Measured with probes running
+on both Macs at once: 13 presses produced 13 events on the sending Mac and zero
+on the receiving one. For a CJK input method, where Caps Lock is the language
+toggle, that leaves the peer stuck on ASCII.
+
+Two approaches that look right and are not:
+
+- Turning off the OS's own Caps-Lock-switches-language on the sender and
+  reimplementing short versus long press in Hammerspoon. That setting is
+  consumed in HIToolbox, which sits above WindowServer, so what the sender does
+  with the key cannot change what WindowServer chooses to forward. Synthesising
+  a substitute keystroke fails for the same reason: it passes through the same
+  filter.
+- Mirroring the input source with `hs.keycodes.inputSourceChanged`. While UC
+  focus is on the peer, the sender's `currentSourceID` does not move at all. The
+  tap sees the event, but HIToolbox has no local focused input context to act
+  on, so there is no state change to mirror.
+
+What works is to stop using the UC link for this and go around it. An eventtap
+on the sender catches the Caps Lock press and asks the peer, over an already
+multiplexed SSH connection, to post a synthetic Caps Lock locally.
+`newSystemKeyEvent(...):post()` injects at the same point hardware events enter,
+and HIToolbox does not distinguish synthetic events from real ones, so the peer
+runs its OWN language switch.
+
+Only the signal is relayed. Short press versus long press is still decided by
+the peer's own OS, and the tap never swallows the event, so the sender keeps its
+native behaviour and both Macs switch together.
+
+Latency is the one thing that needs care. A cold SSH measured 296 ms, enough for
+the first character after a switch to land in the wrong language. With
+`ControlMaster` plus `ControlPersist` the same round trip, remote `hs` call
+included, is 50 to 80 ms, because most of a cold SSH is TCP and crypto
+negotiation rather than data. Two gotchas that cost real time here: the control
+socket path has to stay short, since a Unix domain socket path caps out near 104
+characters and a longer one simply fails, and the `hs` CLI blocks forever unless
+its stdin is redirected from `/dev/null`.
+
 ## Known Limitations
 
+- **Universal Control does not forward Caps Lock.** Verified with simultaneous
+  probes on both Macs: 13 presses, 13 events on the sender, zero on the
+  receiver. Nothing on the receiving Mac can tap an event that never arrives, so
+  a CJK language toggle bound to Caps Lock needs an out-of-band relay. See
+  [Per-machine extras](#per-machine-extras-optional).
 - **No UC / local discrimination for buttons.** CGEvents from Universal Control
   arrive with the same `srcPID=0` as local HID events, so the remap applies to
   any mouse on the receiving Mac. The trackpad exemption on scroll inversion

@@ -1,0 +1,171 @@
+-- =====================================================================
+--  extras.lua.example
+--
+--  Copy to ~/.hammerspoon/extras.lua and edit PEER below.
+--
+--  Both variants of this project load ~/.hammerspoon/extras.lua after the
+--  mouse remap is running. The file is optional and switch.sh never
+--  touches it, so anything here survives switching variants.
+--
+--  Two recipes, both built for a two-Mac Universal Control desk where
+--  the keyboard and mouse live on ONE Mac:
+--
+--    1. a lock key that sleeps the displays on BOTH Macs
+--    2. Caps Lock language switching that reaches the OTHER Mac
+--
+--  Both need SSH from this Mac to the peer: Remote Login enabled on the
+--  peer, key-only auth, and a Host alias in ~/.ssh/config. Recipe 2 also
+--  needs Hammerspoon running on the peer.
+-- =====================================================================
+
+-- A Host alias in ~/.ssh/config, e.g.
+--     Host peer-mac
+--         HostName 100.x.y.z          # Tailscale address works well here
+--         User youruser
+--         IdentityFile ~/.ssh/id_ed25519
+-- Set PEER to nil to make everything below local-only.
+local PEER = "peer-mac"
+
+-- ControlMaster keeps ONE multiplexed SSH connection alive, which is what
+-- makes recipe 2 usable at all: measured 296 ms for a cold SSH versus 50
+-- to 80 ms over an established master, remote command included. Most of a
+-- cold SSH is TCP plus crypto negotiation, not data.
+--
+-- The control socket path must stay SHORT. A Unix domain socket path caps
+-- out near 104 characters and a longer one just fails, so keep it in /tmp
+-- rather than somewhere nested.
+local MUX = "/tmp/cm-" .. tostring(PEER)
+
+local function peerArgs(remoteCmd)
+    return { "-o", "BatchMode=yes",
+             "-o", "ConnectTimeout=3",
+             "-o", "ControlMaster=auto",
+             "-o", "ControlPath=" .. MUX,
+             "-o", "ControlPersist=600",
+             PEER, remoteCmd }
+end
+
+
+-- ---------------------------------------------------------------------
+--  Recipe 1: lock key → displays off on BOTH Macs
+-- ---------------------------------------------------------------------
+-- Display sleep only, via `pmset displaysleepnow`. Both Macs stay awake,
+-- so Universal Control, Tailscale and SSH keep running. Waking is one
+-- keypress on either machine.
+--
+-- Which combo to bind depends on your keyboard, and the answer is often
+-- surprising. Two measured examples:
+--
+--   Logitech MX Keys (Mac layout)  emits plain ⌃⌘Q, which IS macOS's own
+--                                  lock-screen shortcut. Binding a hotkey
+--                                  to it preempts the system lock.
+--
+--   8BitDo Retro 108 (PC layout)   emits Win+L, the Windows lock
+--                                  shortcut, i.e. Left GUI + L on the
+--                                  wire. If that Mac also has Option and
+--                                  Command swapped for the keyboard under
+--                                  System Settings > Keyboard > Keyboard
+--                                  Shortcuts > Modifier Keys, Left GUI
+--                                  arrives as Option, so the event lands
+--                                  as ⌥L rather than ⌘L.
+--
+-- Probe your own key before binding: set PROBE_MODE in init.lua, or use a
+-- small eventtap that prints getKeyCode() and getFlags().
+--
+-- Note that a CGEvent carries no device id, so a hotkey bound here fires
+-- for that combo from ANY keyboard on the Mac. Pick a combo you never
+-- type. If you need per-device behaviour, an eventtap can additionally
+-- check `keyboardEventKeyboardType`.
+
+local function displaysOff()
+    if PEER then
+        -- async, so an unreachable peer never delays the local switch-off
+        hs.task.new("/usr/bin/ssh", nil,
+            peerArgs("pmset displaysleepnow")):start()
+    end
+    hs.execute("/usr/bin/pmset displaysleepnow")
+end
+
+-- Kept in a global table so the bindings are not garbage collected.
+displayOffHotkeys = {
+    hs.hotkey.bind({ "ctrl", "cmd" }, "q", displaysOff),  -- Mac-layout lock key
+    hs.hotkey.bind({ "alt"         }, "l", displaysOff),  -- PC-layout lock key
+}
+
+
+-- ---------------------------------------------------------------------
+--  Recipe 2: Caps Lock language switch across Universal Control
+-- ---------------------------------------------------------------------
+-- The problem: with Universal Control focus on the peer, pressing Caps
+-- Lock does nothing there. For CJK input methods that is the language
+-- toggle, so the peer becomes unusable for anything but ASCII.
+--
+-- Universal Control does not forward Caps Lock. Measured with probes
+-- running on BOTH Macs at once: 13 presses produced 13 events on the
+-- sending Mac and ZERO on the receiving one. WindowServer does the UC
+-- forwarding and simply omits this key.
+--
+-- Two things that look like fixes and are not:
+--
+--   * Turning off the OS's own Caps-Lock-switches-language on the sender
+--     and reimplementing short versus long press here. That setting is
+--     consumed in HIToolbox, which sits ABOVE WindowServer, so what the
+--     sender does with the key cannot change what WindowServer forwards.
+--     Synthesising a substitute keystroke does not help either: it passes
+--     through the same WindowServer filter.
+--
+--   * Mirroring the input source with hs.keycodes.inputSourceChanged.
+--     While UC focus is on the peer, the sender's currentSourceID does
+--     not move at all. The tap sees the event but HIToolbox has no local
+--     focused input context to act on, so there is no state change to
+--     mirror.
+--
+-- What works is to stop using the UC link for this and go around it: tell
+-- the peer over SSH to behave as if Caps Lock had been pressed locally.
+-- `newSystemKeyEvent(...):post()` injects at the same point hardware
+-- events enter, and HIToolbox does not distinguish synthetic events from
+-- real ones, so the peer runs its OWN language switch.
+--
+-- That is the whole point of the design: only the signal is relayed. The
+-- short-press-versus-long-press decision is still made by the peer's own
+-- OS, so nothing about Caps Lock is reimplemented on either side. This
+-- tap NEVER swallows the event (it always returns false), so the sending
+-- Mac's native behaviour is untouched too, and both Macs switch together.
+--
+-- Accepted side effect: a deliberate LONG press to engage real Caps Lock
+-- also sends one toggle to the peer. The send happens on key DOWN,
+-- because waiting to measure the press length would add that delay to
+-- every ordinary switch.
+--
+-- Failure modes, all silent and harmless: peer unreachable, Tailscale
+-- down, or Hammerspoon not running on the peer. `hs.task` is async and
+-- ConnectTimeout is 3 s, so typing on this Mac is never delayed. If the
+-- two Macs' input states drift apart, one more Caps Lock press realigns
+-- them.
+
+local REMOTE_CAPS = [[/opt/homebrew/bin/hs -q -n -t 3 -c ]]
+    .. [['hs.eventtap.event.newSystemKeyEvent("CAPS_LOCK",true):post(); ]]
+    .. [[hs.eventtap.event.newSystemKeyEvent("CAPS_LOCK",false):post()' < /dev/null]]
+-- The `< /dev/null` is required: the `hs` CLI blocks forever waiting on
+-- stdin otherwise. Adjust the path if Hammerspoon's CLI is elsewhere on
+-- the peer; it is not on the PATH of a non-interactive SSH session.
+
+capsBridgeTap = hs.eventtap.new({ hs.eventtap.event.types.systemDefined }, function(e)
+    -- Caps Lock does not arrive as an ordinary keycode. It comes through
+    -- as a system-defined event, and systemKey() resolves it by name, so
+    -- no raw NSEvent decoding is needed here.
+    local sk = e:systemKey()
+    if not (sk and sk.key == "CAPS_LOCK" and sk.down) then return false end
+    if PEER then
+        -- async: a synchronous call would hold the eventtap callback and
+        -- stall every keystroke until SSH returned.
+        hs.task.new("/usr/bin/ssh", nil, peerArgs(REMOTE_CAPS)):start()
+    end
+    return false   -- never swallow, or the local language switch dies
+end)
+
+if PEER then capsBridgeTap:start() end
+
+
+print(("extras: displays-off hotkeys + caps-lock language bridge %s")
+      :format(PEER and ("-> " .. PEER) or "OFF (no peer)"))
