@@ -7,15 +7,16 @@
 --  mouse remap is running. The file is optional and switch.sh never
 --  touches it, so anything here survives switching variants.
 --
---  Two recipes, both built for a two-Mac Universal Control desk where
---  the keyboard and mouse live on ONE Mac:
+--  Three recipes for a two-Mac Universal Control desk where the keyboard
+--  and mouse live on ONE Mac:
 --
 --    1. a lock key that sleeps the displays on BOTH Macs
 --    2. Caps Lock language switching that reaches the OTHER Mac
+--    3. Caps Lock that can never lock uppercase
 --
---  Both need SSH from this Mac to the peer: Remote Login enabled on the
---  peer, key-only auth, and a Host alias in ~/.ssh/config. Recipe 2 also
---  needs Hammerspoon running on the peer.
+--  1 and 2 need SSH from this Mac to the peer: Remote Login enabled on
+--  the peer, key-only auth, and a Host alias in ~/.ssh/config. Recipe 2
+--  also needs Hammerspoon running on the peer.
 -- =====================================================================
 
 -- A Host alias in ~/.ssh/config, e.g.
@@ -26,9 +27,13 @@
 -- Set PEER to nil to make everything below local-only.
 local PEER = "peer-mac"
 
+-- Set true to let Caps Lock behave normally, i.e. long press really locks
+-- uppercase. See recipe 3 for why the default here is false.
+local ALLOW_CAPS_LOCK = false
+
 -- ControlMaster keeps ONE multiplexed SSH connection alive, which is what
--- makes recipe 2 usable at all: measured 296 ms for a cold SSH versus 50
--- to 80 ms over an established master, remote command included. Most of a
+-- makes recipe 2 usable at all: measured 296 ms for a cold SSH versus 80
+-- to 90 ms over an established master, remote command included. Most of a
 -- cold SSH is TCP plus crypto negotiation, not data.
 --
 -- The control socket path must stay SHORT. A Unix domain socket path caps
@@ -43,6 +48,25 @@ local function peerArgs(remoteCmd)
              "-o", "ControlPath=" .. MUX,
              "-o", "ControlPersist=600",
              PEER, remoteCmd }
+end
+
+-- IMPORTANT, and easy to get wrong. A CGEventTap callback is SYNCHRONOUS:
+-- WindowServer holds the event until the callback returns. Forking a
+-- process in there costs 1.06 ms median and 3.05 ms max (measured), and
+-- that delay lands on the very key event that triggered the callback.
+-- For Caps Lock it skews the press duration macOS uses to choose between
+-- switching language and locking uppercase, because the delay hits
+-- key-down while key-up goes through untouched. Repeated presses pile up
+-- processes and make it worse.
+--
+-- Scheduling instead costs 0.006 ms, 175x less, and moves the fork to the
+-- next event-loop pass. Every peer call below goes through here, so no
+-- event ever waits on a fork.
+local function peerAsync(remoteCmd)
+    if not PEER then return end
+    hs.timer.doAfter(0, function()
+        hs.task.new("/usr/bin/ssh", nil, peerArgs(remoteCmd)):start()
+    end)
 end
 
 
@@ -78,11 +102,7 @@ end
 -- check `keyboardEventKeyboardType`.
 
 local function displaysOff()
-    if PEER then
-        -- async, so an unreachable peer never delays the local switch-off
-        hs.task.new("/usr/bin/ssh", nil,
-            peerArgs("pmset displaysleepnow")):start()
-    end
+    peerAsync("pmset displaysleepnow")
     hs.execute("/usr/bin/pmset displaysleepnow")
 end
 
@@ -120,52 +140,105 @@ displayOffHotkeys = {
 --     focused input context to act on, so there is no state change to
 --     mirror.
 --
--- What works is to stop using the UC link for this and go around it: tell
--- the peer over SSH to behave as if Caps Lock had been pressed locally.
--- `newSystemKeyEvent(...):post()` injects at the same point hardware
--- events enter, and HIToolbox does not distinguish synthetic events from
--- real ones, so the peer runs its OWN language switch.
+-- So leave the UC link alone and go around it: ask the peer over SSH to
+-- switch its input source directly.
 --
--- That is the whole point of the design: only the signal is relayed. The
--- short-press-versus-long-press decision is still made by the peer's own
--- OS, so nothing about Caps Lock is reimplemented on either side. This
--- tap NEVER swallows the event (it always returns false), so the sending
--- Mac's native behaviour is untouched too, and both Macs switch together.
+-- DO NOT post a synthetic Caps Lock on the peer instead. That was the
+-- first version of this recipe and it is a trap. Two back-to-back
+-- `newSystemKeyEvent(...):post()` calls make a press with NO duration,
+-- and macOS chooses between "switch language" and "lock uppercase" by how
+-- long the key is held, so a zero-length press can land on either side.
+-- In practice the peer sometimes switched language and sometimes engaged
+-- uppercase. And there is no way back: since UC does not forward Caps
+-- Lock, once uppercase is locked on the peer no key you press can release
+-- it. The relay can set that state but not clear it.
 --
--- Accepted side effect: a deliberate LONG press to engage real Caps Lock
--- also sends one toggle to the peer. The send happens on key DOWN,
--- because waiting to measure the press length would add that delay to
--- every ordinary switch.
+-- Setting the source directly loses nothing. The peer's own short-versus-
+-- long logic is unreachable by definition, because a real Caps Lock never
+-- arrives there. Measured deterministic: 4 of 4 clean alternations with
+-- the peer's capslock flag staying false throughout.
 --
--- Failure modes, all silent and harmless: peer unreachable, Tailscale
--- down, or Hammerspoon not running on the peer. `hs.task` is async and
--- ConnectTimeout is 3 s, so typing on this Mac is never delayed. If the
--- two Macs' input states drift apart, one more Caps Lock press realigns
--- them.
+-- Find your own identifiers by running this on the peer:
+--     hs -c 'return hs.keycodes.currentSourceID()'
+-- once per state.
+local KO_SOURCE = "com.apple.inputmethod.Korean.2SetKorean"
+local EN_SOURCE = "com.apple.keylayout.ABC"
 
-local REMOTE_CAPS = [[/opt/homebrew/bin/hs -q -n -t 3 -c ]]
-    .. [['hs.eventtap.event.newSystemKeyEvent("CAPS_LOCK",true):post(); ]]
-    .. [[hs.eventtap.event.newSystemKeyEvent("CAPS_LOCK",false):post()' < /dev/null]]
--- The `< /dev/null` is required: the `hs` CLI blocks forever waiting on
--- stdin otherwise. Adjust the path if Hammerspoon's CLI is elsewhere on
--- the peer; it is not on the PATH of a non-interactive SSH session.
+-- Single-quoted for the remote shell, so the Lua inside must use double
+-- quotes only. The `< /dev/null` is required: the hs CLI blocks forever
+-- waiting on stdin otherwise. The full path is required too, because the
+-- CLI is not on the PATH of a non-interactive SSH session.
+local REMOTE_TOGGLE = ([[/opt/homebrew/bin/hs -q -n -t 3 -c ']]
+    .. [[local KO,EN="%s","%s"; ]]
+    .. [[local id=hs.keycodes.currentSourceID(); ]]
+    .. [[hs.keycodes.currentSourceID(id:match("Korean") and EN or KO)]]
+    .. [[' < /dev/null]]):format(KO_SOURCE, EN_SOURCE)
 
+-- This tap NEVER swallows the event (always returns false), so the
+-- sender's own native Caps Lock handling is untouched. Only the peer is
+-- driven.
 capsBridgeTap = hs.eventtap.new({ hs.eventtap.event.types.systemDefined }, function(e)
-    -- Caps Lock does not arrive as an ordinary keycode. It comes through
-    -- as a system-defined event, and systemKey() resolves it by name, so
-    -- no raw NSEvent decoding is needed here.
+    -- Caps Lock is not an ordinary keycode; it arrives as a
+    -- system-defined event, and systemKey() resolves it by name.
     local sk = e:systemKey()
     if not (sk and sk.key == "CAPS_LOCK" and sk.down) then return false end
-    if PEER then
-        -- async: a synchronous call would hold the eventtap callback and
-        -- stall every keystroke until SSH returned.
-        hs.task.new("/usr/bin/ssh", nil, peerArgs(REMOTE_CAPS)):start()
-    end
-    return false   -- never swallow, or the local language switch dies
+    peerAsync(REMOTE_TOGGLE)
+    return false
 end)
 
 if PEER then capsBridgeTap:start() end
 
 
-print(("extras: displays-off hotkeys + caps-lock language bridge %s")
-      :format(PEER and ("-> " .. PEER) or "OFF (no peer)"))
+-- ---------------------------------------------------------------------
+--  Recipe 3: Caps Lock never locks uppercase
+-- ---------------------------------------------------------------------
+-- If Caps Lock is only ever wanted as a language key, remove the locked
+-- state instead of trying to make misfires rarer. Being stuck in
+-- uppercase with no reliable way out is much worse than the misfire.
+--
+-- This cannot interfere with the language switch: a short press for the
+-- switch never sets the capslock flag at all.
+--
+-- TWO mechanisms, deliberately. The event tap is the fast path, reacting
+-- a millisecond or two after the lock engages. The timer is the actual
+-- guarantee, because not every route into the locked state emits a
+-- flagsChanged: hs.hid.capslock.set() writes the IOKit state directly and
+-- produces no event whatsoever, so a tap-only guard silently misses it.
+-- get() costs 0.0865 ms, so polling at 0.15 s is about 0.06 percent of
+-- one core.
+--
+-- The tap defers its clear rather than doing it inline, because set()
+-- itself produces a flagsChanged and would re-enter this callback, and
+-- because the callback has to stay fast for the same reason peerAsync
+-- exists.
+--
+-- Tradeoff: a long press still shows uppercase for up to 0.15 s before it
+-- is dropped, so a stray capital can slip through if you type instantly.
+-- Mapping Caps Lock to "No Action" in Modifier Keys prevents the lock
+-- outright, but that kills the language switch too.
+--
+-- Set ALLOW_CAPS_LOCK = true at the top for normal behaviour.
+
+local function dropCapsLock()
+    if hs.hid.capslock.get() then hs.hid.capslock.set(false) end
+end
+
+capsLockGuardTap = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, function(e)
+    if e:getKeyCode() == 57 then                  -- 57 = Caps Lock
+        hs.timer.doAfter(0, dropCapsLock)
+    end
+    return false
+end)
+
+capsLockGuardTimer = hs.timer.new(0.15, dropCapsLock)
+
+if not ALLOW_CAPS_LOCK then
+    capsLockGuardTap:start()
+    capsLockGuardTimer:start()
+    dropCapsLock()          -- also covers a lock already on at load time
+end
+
+
+print(("extras: displays-off hotkeys | caps language bridge %s | caps-lock guard %s")
+      :format(PEER and ("-> " .. PEER) or "OFF",
+              ALLOW_CAPS_LOCK and "OFF" or "ON"))

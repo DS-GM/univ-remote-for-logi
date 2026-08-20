@@ -236,9 +236,9 @@ to the Hammerspoon Console rather than dying quietly. `switch.sh` never touches
 it, so personal or machine-specific bindings survive switching between the
 `mx-master-4` and `mx-master-3s` variants.
 
-[extras.lua.example](extras.lua.example) is a working file with two recipes for
-the same two-Mac Universal Control desk this project targets. Copy it to
-`~/.hammerspoon/extras.lua` and edit the `PEER` line. Both recipes need SSH from
+[extras.lua.example](extras.lua.example) is a working file with three recipes
+for the same two-Mac Universal Control desk this project targets. Copy it to
+`~/.hammerspoon/extras.lua` and edit the `PEER` line. The first two need SSH from
 the Mac holding the keyboard to the peer, so Remote Login on the peer and
 key-only auth. The second also needs Hammerspoon running there.
 
@@ -277,23 +277,71 @@ Two approaches that look right and are not:
 
 What works is to stop using the UC link for this and go around it. An eventtap
 on the sender catches the Caps Lock press and asks the peer, over an already
-multiplexed SSH connection, to post a synthetic Caps Lock locally.
-`newSystemKeyEvent(...):post()` injects at the same point hardware events enter,
-and HIToolbox does not distinguish synthetic events from real ones, so the peer
-runs its OWN language switch.
+multiplexed SSH connection, to switch its input source directly.
 
-Only the signal is relayed. Short press versus long press is still decided by
-the peer's own OS, and the tap never swallows the event, so the sender keeps its
-native behaviour and both Macs switch together.
+**Do not post a synthetic Caps Lock on the peer instead.** That was the first
+version of this recipe, and it is worth explaining why it fails, because it works
+often enough to look correct. Two back-to-back `newSystemKeyEvent(...):post()`
+calls produce a press with no duration, and macOS chooses between "switch
+language" and "lock uppercase" by how long the key is held, so a zero-length
+press can land on either side. In practice the peer sometimes switched language
+and sometimes engaged uppercase. Worse, there is no way back: since UC does not
+forward Caps Lock, once uppercase is locked on the peer, no key you press can
+release it. The relay could set that state but not clear it.
 
-Latency is the one thing that needs care. A cold SSH measured 296 ms, enough for
-the first character after a switch to land in the wrong language. With
-`ControlMaster` plus `ControlPersist` the same round trip, remote `hs` call
-included, is 50 to 80 ms, because most of a cold SSH is TCP and crypto
-negotiation rather than data. Two gotchas that cost real time here: the control
-socket path has to stay short, since a Unix domain socket path caps out near 104
-characters and a longer one simply fails, and the `hs` CLI blocks forever unless
-its stdin is redirected from `/dev/null`.
+Setting the source directly loses nothing. The peer's own short-versus-long logic
+is unreachable by definition, because a real Caps Lock never arrives there.
+Measured deterministic: four of four clean alternations with the peer's `capslock`
+flag staying false throughout.
+
+The sender's own Caps Lock handling stays native, because the tap never swallows
+the event. Only the peer is driven.
+
+Latency needs care. A cold SSH measured 296 ms, enough for the first character
+after a switch to land in the wrong language. With `ControlMaster` plus
+`ControlPersist` the same round trip, remote `hs` call included, is 80 to 90 ms,
+because most of a cold SSH is TCP and crypto negotiation rather than data. Two
+gotchas that cost real time here: the control socket path has to stay short,
+since a Unix domain socket path caps out near 104 characters and a longer one
+simply fails, and the `hs` CLI blocks forever unless its stdin is redirected from
+`/dev/null`.
+
+### Never fork inside an eventtap callback
+
+A `CGEventTap` callback is synchronous: WindowServer holds the event until the
+callback returns. `hs.task.new():start()` forks a process, measured at 1.06 ms
+median and 3.05 ms maximum, and that delay lands on the very key event that
+triggered the callback. For Caps Lock it matters, because the delay hits key-down
+while key-up goes through untouched, which skews the press duration macOS uses to
+choose between switching language and locking uppercase. Repeated presses pile up
+processes and make it worse.
+
+Wrapping the spawn in `hs.timer.doAfter(0, ...)` costs 0.006 ms, 175 times less,
+and moves the fork to the next event-loop pass. Every peer call in the example
+goes through one helper that does exactly this.
+
+### Making Caps Lock never lock uppercase
+
+If Caps Lock is only ever wanted as a language key, the safest thing is to remove
+the locked state rather than trying to make misfires rarer. Being stuck in
+uppercase with no reliable way out is much worse than the misfire itself.
+
+The example does it with two mechanisms on purpose:
+
+- an eventtap on `flagsChanged` for keycode 57, which reacts a millisecond or two
+  after the lock engages
+- a 0.15 s timer polling `hs.hid.capslock.get()`, which is the actual guarantee
+
+The timer is not redundant. Not every route into the locked state emits a
+`flagsChanged`: `hs.hid.capslock.set()` writes the IOKit state directly and
+produces no event at all, so a tap-only guard silently misses it. That is not
+hypothetical, it is how the first version of this guard failed. `get()` costs
+0.0865 ms, so polling at 0.15 s is roughly 0.06 percent of one core.
+
+The tradeoff is that a long press still shows uppercase for up to 0.15 s before
+it is dropped, so a stray capital can slip through if you type immediately.
+Mapping Caps Lock to **No Action** under Modifier Keys prevents the lock
+outright, but it kills the language switch along with it.
 
 ## Known Limitations
 
