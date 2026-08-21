@@ -306,6 +306,31 @@ since a Unix domain socket path caps out near 104 characters and a longer one
 simply fails, and the `hs` CLI blocks forever unless its stdin is redirected from
 `/dev/null`.
 
+### Do not extend this to the local Mac
+
+The obvious next thought is to take Caps Lock over on the sending Mac too,
+since macOS's own handling of it is unreliable there: it decides between
+switching language and locking uppercase by hold time, and that judgement
+misfires. Swallowing the event so macOS cannot also toggle, then setting the
+local source from the tap, switched perfectly. Measured 53 of 53 presses
+correct, zero mismatches, tap never disabled, across two runs.
+
+It was still reverted. Setting the source out of band does not coordinate
+with the input method's **composition buffer**. A half-composed Korean
+syllable stays pending and gets committed after the characters typed next, so
+`ㅁㄴㅇ` then Caps Lock then `asd` came out as `ㅁㄴasdㅇ`, consistently. That
+reads as a failed switch but is a reordering.
+
+Making the switch synchronous inside the callback did not help, and the
+numbers say why: the delay is the `hs.keycodes.currentSourceID()` call
+itself, 32 ms median inline against 33 ms deferred, and the input method
+commits on its own schedule afterwards, which blocking an event tap cannot
+reorder. macOS's native path avoids all of it because HIToolbox tells the
+input method to commit as part of the switch.
+
+So the trade is deliberate: an occasional missed switch on the local Mac
+beats characters landing in the wrong order.
+
 ### Never fork inside an eventtap callback
 
 A `CGEventTap` callback is synchronous: WindowServer holds the event until the

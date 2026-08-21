@@ -177,6 +177,20 @@ local REMOTE_TOGGLE = ([[/opt/homebrew/bin/hs -q -n -t 3 -c ']]
 -- This tap NEVER swallows the event (always returns false), so the
 -- sender's own native Caps Lock handling is untouched. Only the peer is
 -- driven.
+--
+-- Do not extend this to the local Mac as well. It was tried: swallow the
+-- event so macOS cannot also toggle, then set this Mac's source here too.
+-- The switching worked perfectly, 53 of 53 presses, zero mismatches. It
+-- was still reverted, because setting the source out of band does not
+-- coordinate with the input method's COMPOSITION BUFFER. A half-composed
+-- Korean syllable stays pending and commits after the characters typed
+-- next, so "ㅁㄴㅇ" + Caps Lock + "asd" came out "ㅁㄴasdㅇ" every time.
+-- Doing the switch synchronously inside this callback did not help: the
+-- delay is hs.keycodes.currentSourceID() itself, 32 ms median inline
+-- against 33 ms deferred, and the input method commits on its own
+-- schedule afterwards regardless. macOS's native path avoids it because
+-- HIToolbox tells the input method to commit as part of the switch. Its
+-- reliability is worse, but a missed switch beats reordered characters.
 capsBridgeTap = hs.eventtap.new({ hs.eventtap.event.types.systemDefined }, function(e)
     -- Caps Lock is not an ordinary keycode; it arrives as a
     -- system-defined event, and systemKey() resolves it by name.
