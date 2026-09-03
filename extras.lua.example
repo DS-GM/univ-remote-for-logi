@@ -13,10 +13,13 @@
 --    1. a lock key that sleeps the displays on BOTH Macs
 --    2. Caps Lock language switching that reaches the OTHER Mac
 --    3. Caps Lock that can never lock uppercase
+--    4. one key OR one spare mouse button that cycles the sound
+--       output device
 --
 --  1 and 2 need SSH from this Mac to the peer: Remote Login enabled on
 --  the peer, key-only auth, and a Host alias in ~/.ssh/config. Recipe 2
 --  also needs Hammerspoon running on the peer.
+--  3 and 4 are local-only and work with PEER = nil.
 -- =====================================================================
 
 -- A Host alias in ~/.ssh/config, e.g.
@@ -293,7 +296,93 @@ if not ALLOW_CAPS_LOCK then
 end
 
 
-print(("extras: displays-off ⌃⌘Q + ⌥L | caps: local=%s peer=%s guard=%s")
+
+-- ---------------------------------------------------------------------
+--  3. Cycle the sound output device from one key
+-- ---------------------------------------------------------------------
+-- macOS has NO built-in shortcut for this. The only native routes are
+-- Option-clicking the volume item in the menu bar and the Sound module in
+-- Control Center, and both are mouse-only: there is no entry for output
+-- switching anywhere under System Settings > Keyboard > Keyboard
+-- Shortcuts. (verified 2026-09-03)
+--
+-- So the hotkey has to come from here. Three modifiers is deliberate:
+-- ctrl-alt-cmd-O collides with nothing in macOS or in any app, and Logi
+-- Options+ can send it verbatim as a "Keystroke assignment" on any MX
+-- button, which is how a mouse button ends up driving this. That path also
+-- survives Universal Control, because Options+ emits the keystroke on the
+-- sending Mac and WindowServer forwards ordinary key events fine. Caps
+-- Lock is the one it drops, see section 2.
+--
+-- allOutputDevices() lists CONNECTED devices only, so an unplugged monitor
+-- or a parked headset leaves the cycle by itself and nothing here has to
+-- track it.
+--
+-- ponytail: cycles every connected device in the order the system reports.
+-- If one of them is always in the way, replace the list with a preferred
+-- table of uids and cycle that instead.
+--
+-- Check it without touching the keyboard. Three runs should walk the list
+-- and come back to where they started:
+--     hs -c 'soundOutputCycle(); return hs.audiodevice.defaultOutputDevice():name()'
+function soundOutputCycle()
+    local devs = hs.audiodevice.allOutputDevices()
+    if #devs == 0 then return end
+    local cur, at = hs.audiodevice.defaultOutputDevice(), 0
+    for i, d in ipairs(devs) do
+        if cur and d:uid() == cur:uid() then
+            at = i
+            break
+        end
+    end
+    local nextDev = devs[(at % #devs) + 1]
+    nextDev:setDefaultOutputDevice()
+    hs.alert.closeAll()
+    hs.alert.show(nextDev:name(), 0.8)
+end
+
+soundOutputHotkey = hs.hotkey.bind({ "ctrl", "alt", "cmd" }, "o", soundOutputCycle)
+
+-- Same action on the MX Master 4's third side button, the one Options+
+-- would normally own. It arrives as CGEvent button 5 (verified 2026-09-03
+-- with a temporary otherMouseDown probe: two presses, both 5). The
+-- thumb-rest gesture pad is 6, which is why init.lua sets GESTURE_BUTTON = 6
+-- and warns against 5.
+--
+-- This lives here rather than in init.lua for one reason: switch.sh
+-- overwrites init.lua when the mouse variant changes and never touches
+-- this file. init.lua's tap returns false for every non-gesture button, so
+-- the event reaches this tap untouched.
+--
+-- On an MX Master 3S there is no third side button. Set PROBE_MODE = true
+-- in init.lua to read the number of whatever button you do have spare.
+--
+-- The work is deferred for the reason given at the top of this file. The
+-- switch itself measured 2.12 ms mean and 4.49 ms worst over 6 runs, which
+-- is real time to make WindowServer hold a mouse event for. Enumeration is
+-- free next to that: 0.18 ms for allOutputDevices(), 0.09 ms for
+-- defaultOutputDevice().
+--
+-- Down and up are both swallowed so nothing downstream sees half a click.
+-- Drag is deliberately NOT swallowed, unlike the gesture button in
+-- init.lua: freezing the cursor is the point there and pointless here.
+local SOUND_BUTTON = 5
+
+soundOutputButtonTap = hs.eventtap.new(
+    { hs.eventtap.event.types.otherMouseDown,
+      hs.eventtap.event.types.otherMouseUp },
+    function(e)
+        local btn = e:getProperty(hs.eventtap.event.properties.mouseEventButtonNumber)
+        if btn ~= SOUND_BUTTON then return false end
+        if e:getType() == hs.eventtap.event.types.otherMouseDown then
+            soon(soundOutputCycle)
+        end
+        return true
+    end)
+soundOutputButtonTap:start()
+
+
+print(("extras: displays-off ⌃⌘Q + ⌥L | sound-output ⌃⌥⌘O + btn5 | caps: local=%s peer=%s guard=%s")
       :format(LOCAL_CAPS_TOGGLE and "ON" or "OFF",
               PEER and PEER or "OFF",
               ALLOW_CAPS_LOCK and "OFF" or "ON"))

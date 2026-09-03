@@ -236,11 +236,12 @@ to the Hammerspoon Console rather than dying quietly. `switch.sh` never touches
 it, so personal or machine-specific bindings survive switching between the
 `mx-master-4` and `mx-master-3s` variants.
 
-[extras.lua.example](extras.lua.example) is a working file with three recipes
+[extras.lua.example](extras.lua.example) is a working file with four recipes
 for the same two-Mac Universal Control desk this project targets. Copy it to
 `~/.hammerspoon/extras.lua` and edit the `PEER` line. The first two need SSH from
 the Mac holding the keyboard to the peer, so Remote Login on the peer and
-key-only auth. The second also needs Hammerspoon running there.
+key-only auth. The second also needs Hammerspoon running there. The last two are
+local-only and work with `PEER = nil`.
 
 ### One key, displays off on both Macs
 
@@ -367,6 +368,40 @@ The tradeoff is that a long press still shows uppercase for up to 0.15 s before
 it is dropped, so a stray capital can slip through if you type immediately.
 Mapping Caps Lock to **No Action** under Modifier Keys prevents the lock
 outright, but it kills the language switch along with it.
+
+### One button, cycle the sound output device
+
+**macOS has no shortcut for switching the sound output device.** There is no
+entry for one anywhere under **System Settings > Keyboard > Keyboard
+Shortcuts**, and the two native routes are both mouse-only: Option-clicking the
+volume item in the menu bar, and the Sound module in Control Center.
+
+`hs.audiodevice` covers it in a dozen lines. `allOutputDevices()` returns
+connected devices only, so an unplugged monitor or a parked headset drops out of
+the cycle by itself and nothing has to track state.
+
+The example binds the same action twice, to ⌃⌥⌘O and to mouse button 5. Three
+modifiers on the key is deliberate: the combination collides with nothing in
+macOS or in any app, and Logi Options+ can send it verbatim as a keystroke
+assignment, which is the only route left if the mouse is being forwarded by
+Universal Control, since Options+ runs on the sending Mac and sees no device on
+the receiving one.
+
+Button 5 is the MX Master 4's third side button, the one whose arrival pushed the
+gesture pad to 6. Probe before binding: `PROBE_MODE` in `init.lua` reports the
+number of whatever you press. The binding belongs in `extras.lua` rather than in
+either variant's `init.lua`, because `switch.sh` overwrites `init.lua` and a
+spare-button assignment has nothing to do with which mouse generation is
+installed. `init.lua` returns false for every non-gesture button, so the event
+reaches the extras tap untouched.
+
+Costs matter here because the work sits inside an eventtap callback. Enumeration
+is free, 0.18 ms for `allOutputDevices()` and 0.09 ms for
+`defaultOutputDevice()`, but the switch itself measured 2.12 ms mean and 4.49 ms
+worst over six runs, so it goes through the same `hs.timer.doAfter(0, ...)`
+helper as every other deferred action in the file. Button down and up are both
+swallowed so nothing downstream sees half a click. Drag is not swallowed, unlike
+the gesture button: the cursor freeze is wanted there and pointless here.
 
 ## Known Limitations
 
